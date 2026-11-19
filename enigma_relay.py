@@ -38,43 +38,54 @@ MAX_MORSE = 12000
 TTL = 24 * 3600
 OK_MORSE = set(".-| ")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
-SUPABASE_ANON_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+SUPABASE_ANON_KEY = ""  # Audit writes require a server-only secret key
 
 
 def audit_event(message, event_type, status, error=None):
-    """Append audit event; never persist Enigma key codes or auth tokens."""
-    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        print("AUDIT NOT CONFIGURED: missing Supabase environment variables")
+    """Append a full message/event record. Never persist Enigma keys or auth tokens."""
+    api_key = (os.environ.get("SUPABASE_SECRET_KEY")
+               or os.environ.get("SUPABASE_SERVICE_ROLE_KEY", ""))
+    if not SUPABASE_URL or not api_key:
+        print("AUDIT NOT CONFIGURED: missing SUPABASE_URL or server secret key")
         return False
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     row = {
         "message_id": message.get("message_id"),
         "event_type": event_type,
-        "delivery_status": status,
         "sender_code": message.get("from", ""),
         "recipient_code": message.get("to", ""),
-        "message_text": message.get("text", ""),
+        "raw_text": message.get("text", ""),
         "morse_payload": message.get("morse", ""),
         "wpm": message.get("wpm"),
-        "machine_settings": message.get("mk"),
+        "machine_settings": {"mk": message.get("mk", [])},
+        "encryption_settings": {"key_code_present": bool(message.get("key"))},
         "key_code_present": bool(message.get("key")),
-        "message_bytes": len(message.get("text", "").encode("utf-8")),
-        "event_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "message_size_bytes": len(message.get("text", "").encode("utf-8")),
+        "status": status,
+        "event_at": now,
+        "sent_at": now if event_type == "accepted_by_relay" else None,
+        "received_at": now if event_type == "polled_by_recipient" else None,
+        "delivered_at": now if event_type == "polled_by_recipient" else None,
         "error": error,
     }
     try:
+        headers = {
+            "apikey": api_key,
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        }
+        # Legacy service_role keys are JWTs and also use Authorization.
+        if api_key.startswith("eyJ"):
+            headers["Authorization"] = "Bearer " + api_key
         req = urllib.request.Request(
             SUPABASE_URL + "/rest/v1/enigma_message_audit",
             data=json.dumps(row, ensure_ascii=False).encode("utf-8"),
-            headers={"apikey": SUPABASE_ANON_KEY,
-                     "Authorization": "Bearer " + SUPABASE_ANON_KEY,
-                     "Content-Type": "application/json",
-                     "Prefer": "return=minimal"}, method="POST")
+            headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=8) as response:
             return 200 <= response.status < 300
     except Exception as exc:
         print("AUDIT WRITE FAILED:", str(exc)[:300])
         return False
-
 
 def canon(s):
     return re.sub(r"[^A-Z0-9]", "", str(s).upper())
@@ -189,8 +200,14 @@ class Handler(BaseHTTPRequestHandler):
                     message["key"] = key
                 QUEUES[to].append(message)
                 COND.notify_all()
-        if code == 200:
-            audit_event(message, "accepted_by_relay", "queued")
+        if code == 200 and not audit_event(message, "accepted_by_relay", "queued"):
+            # Do not report a send as successful if its audit record was not saved.
+            with COND:
+                try:
+                    QUEUES[to].remove(message)
+                except (KeyError, ValueError):
+                    pass
+            code, obj = 503, {"error": "Audit storage unavailable; message was not accepted"}
         self._reply(code, obj)
 
 
