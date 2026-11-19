@@ -109,10 +109,16 @@ class Handler(BaseHTTPRequestHandler):
             morse = data.get("morse", "")
             wpm = int(data.get("wpm", 15))
             mk = data.get("mk") or [0, 0, 0]
+            key = data.get("key", "")
+            key_ok = (key == "" or
+                      (isinstance(key, str) and 6 <= len(key) <= 2048
+                       and key.startswith("ENX1-")
+                       and re.fullmatch(r"ENX1-[A-Za-z0-9_-]+", key)))
             ok = (isinstance(morse, str) and 0 < len(morse) <= MAX_MORSE
                   and set(morse) <= OK_MORSE and 5 <= wpm <= 40
                   and isinstance(mk, list) and len(mk) == 3
-                  and all(isinstance(x, int) and 0 <= x < 256 for x in mk))
+                  and all(isinstance(x, int) and 0 <= x < 256 for x in mk)
+                  and key_ok)
         except Exception:
             ok = False
         if not ok:
@@ -131,8 +137,11 @@ class Handler(BaseHTTPRequestHandler):
                 code, obj = 429, {"error": "Their inbox is full"}
             else:
                 LAST_SEND[cid] = now
-                QUEUES[to].append({"from": cid, "morse": morse, "wpm": wpm,
-                                   "mk": mk, "ts": now})
+                message = {"from": cid, "morse": morse, "wpm": wpm,
+                           "mk": mk, "ts": now}
+                if key:
+                    message["key"] = key
+                QUEUES[to].append(message)
                 COND.notify_all()
         self._reply(code, obj)
 
