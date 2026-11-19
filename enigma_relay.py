@@ -188,8 +188,9 @@ class Handler(BaseHTTPRequestHandler):
                 if key:
                     message["key"] = key
                 QUEUES[to].append(message)
-                audit_event(message, "accepted_by_relay", "queued")
                 COND.notify_all()
+        if code == 200:
+            audit_event(message, "accepted_by_relay", "queued")
         self._reply(code, obj)
 
 
